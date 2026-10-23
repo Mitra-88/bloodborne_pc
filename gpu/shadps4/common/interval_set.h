@@ -57,6 +57,12 @@ public:
         intervals.reserve(n);
     }
 
+    /// bbport: replaces the contents with a sorted, disjoint subset of this list (BufferCache
+    /// drops released ranges this way: re-adding them one by one is quadratic).
+    void Reset(List&& list) {
+        intervals = std::move(list);
+    }
+
     /// Adds a range to the interval set.
     void Add(IV value) {
         if (value.start >= value.end) [[unlikely]] {
@@ -143,6 +149,22 @@ public:
 
     /// Calls 'func' for each interval that partially overlaps provided range.
     void ForEachInRange(u64 start, u64 end, auto&& func) const {
+        if (start >= end) [[unlikely]] {
+            return;
+        }
+        auto it = std::ranges::upper_bound(intervals, start, {}, &IV::end);
+        if (it == intervals.end()) {
+            return;
+        }
+        while (it != intervals.end() && it->start < end) {
+            func(*it);
+            ++it;
+        }
+    }
+
+    /// bbport: same, letting 'func' change the intervals (BufferCache::EnsureResident stamps
+    /// the last use of the ranges a binding asked for). Add/Remove while walking is still out.
+    void ForEachInRange(u64 start, u64 end, auto&& func) {
         if (start >= end) [[unlikely]] {
             return;
         }

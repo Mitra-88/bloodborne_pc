@@ -489,6 +489,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // bbport: this is where a range counts as used: what no binding asks for between two sweeps
+    // of ReleaseIdleBacking is freed there.
+    resident_ranges.ForEachInRange(first_block, last_block + 1,
+                                   [this](Backing& backing) { backing.last_use = use_epoch; });
+
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -501,91 +506,99 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
     BbStats::Timer timer{BbStats::t_resident};
 
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
     // BB_ARENA_LIMIT_MB=N: VRAM counts as full once N MiB are backed here (tests the reserve).
     static const u64 arena_limit = [] {
         const char* env = std::getenv("BB_ARENA_LIMIT_MB");
         return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
     }();
-    static u64 arena_allocated = 0;
-    vk::Result alloc_result = vk::Result::eErrorOutOfDeviceMemory;
-    vk::DeviceMemory device_memory{};
-    if (!arena_limit || arena_allocated + alloc_info.allocationSize <= arena_limit) {
-        std::tie(alloc_result, device_memory) = instance.GetDevice().allocateMemory(alloc_info);
-        if (alloc_result == vk::Result::eSuccess) {
-            arena_allocated += alloc_info.allocationSize;
-        }
-    }
-    u64 memory_base{}; ///< the backing's offset in `device_memory` (non-zero in the reserve)
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // bbport: VRAM full. The guest memory the GPU uses is backed here and only grows as areas
-        // load; on 4-8 GB cards it ran out ("ErrorOutOfDeviceMemory" stopped the game). Another
-        // memory type the arena accepts, outside VRAM (system memory the GPU reaches), is slower
-        // but keeps the game going.
-        const auto& props = instance.GetMemoryProperties();
-        const u32 vram_heap = props.memoryTypes[arena_memory_type_index].heapIndex;
-        for (u32 i = 0; i < props.memoryTypeCount && alloc_result != vk::Result::eSuccess; ++i) {
-            if (((arena_memory_type_bits >> i) & 1) == 0 || props.memoryTypes[i].heapIndex == vram_heap) {
-                continue;
-            }
-            alloc_info.memoryTypeIndex = i;
-            std::tie(alloc_result, device_memory) = instance.GetDevice().allocateMemory(alloc_info);
-        }
-        if (alloc_result == vk::Result::eSuccess) {
-            Vulkan::NoteOverBudget("buffer");
-        } else if (reserve_memory && reserve_size - reserve_used >= alloc_info.allocationSize) {
-            // The reserve kept at start for this (no other memory type on NVIDIA).
-            device_memory = reserve_memory;
-            memory_base = reserve_used;
-            const u64 quarter_before = reserve_used * 4 / reserve_size;
-            reserve_used += alloc_info.allocationSize;
-            alloc_result = vk::Result::eSuccess;
-            if (memory_base == 0 || reserve_used * 4 / reserve_size != quarter_before) {
-                std::printf("GPU: video memory full: game memory from its reserve (%llu of %llu "
-                            "MiB used)\n",
-                            static_cast<unsigned long long>(reserve_used >> 20),
-                            static_cast<unsigned long long>(reserve_size >> 20));
-                std::fflush(stdout);
-            }
-        } else {
-            std::printf("GPU: video memory full: no room for %llu MiB of game memory (only VRAM "
-                        "can hold it on this GPU). A lower output resolution or upscaler preset "
-                        "needs less.\n",
-                        static_cast<unsigned long long>(alloc_info.allocationSize >> 20));
-            std::fflush(stdout);
-        }
-    }
-    device_memory = Vulkan::Check(vk::ResultValue<vk::DeviceMemory>{alloc_result, device_memory});
-    arena_backed += alloc_info.allocationSize;
+    const auto device = instance.GetDevice();
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    u64 memory_offset{memory_base};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
     for (const auto& range : bind_ranges) {
+        // bbport: one allocation per gap instead of one for the whole call, so a range can be
+        // released on its own (ReleaseIdleBacking).
+        vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = (range.end - range.start) << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        vk::Result alloc_result = vk::Result::eErrorOutOfDeviceMemory;
+        vk::DeviceMemory device_memory{};
+        if (!arena_limit || arena_allocated + alloc_info.allocationSize <= arena_limit) {
+            std::tie(alloc_result, device_memory) = device.allocateMemory(alloc_info);
+            if (alloc_result == vk::Result::eSuccess) {
+                arena_allocated += alloc_info.allocationSize;
+            }
+        }
+        u64 memory_base{}; ///< the backing's offset in the reserve (zero in its own allocation)
+        bool owned = true; ///< its own allocation: ReleaseIdleBacking may free it
+        if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
+            // bbport: VRAM full. The guest memory the GPU uses is backed here and only grows as
+            // areas load; on 4-8 GB cards it ran out ("ErrorOutOfDeviceMemory" stopped the game).
+            // Another memory type the arena accepts, outside VRAM (system memory the GPU reaches),
+            // is slower but keeps the game going.
+            const auto& props = instance.GetMemoryProperties();
+            const u32 vram_heap = props.memoryTypes[arena_memory_type_index].heapIndex;
+            for (u32 i = 0; i < props.memoryTypeCount && alloc_result != vk::Result::eSuccess; ++i) {
+                if (((arena_memory_type_bits >> i) & 1) == 0 ||
+                    props.memoryTypes[i].heapIndex == vram_heap) {
+                    continue;
+                }
+                alloc_info.memoryTypeIndex = i;
+                std::tie(alloc_result, device_memory) = device.allocateMemory(alloc_info);
+            }
+            if (alloc_result == vk::Result::eSuccess) {
+                Vulkan::NoteOverBudget("buffer");
+                arena_allocated += alloc_info.allocationSize;
+            } else if (reserve_memory && reserve_size - reserve_used >= alloc_info.allocationSize) {
+                // The reserve kept at start for this (no other memory type on NVIDIA).
+                device_memory = reserve_memory;
+                memory_base = reserve_used;
+                owned = false;
+                const u64 quarter_before = reserve_used * 4 / reserve_size;
+                reserve_used += alloc_info.allocationSize;
+                alloc_result = vk::Result::eSuccess;
+                if (memory_base == 0 || reserve_used * 4 / reserve_size != quarter_before) {
+                    std::printf("GPU: video memory full: game memory from its reserve (%llu of "
+                                "%llu MiB used)\n",
+                                static_cast<unsigned long long>(reserve_used >> 20),
+                                static_cast<unsigned long long>(reserve_size >> 20));
+                    std::fflush(stdout);
+                }
+            } else {
+                std::printf("GPU: video memory full: no room for %llu MiB of game memory (only "
+                            "VRAM can hold it on this GPU). A lower output resolution or upscaler "
+                            "preset needs less.\n",
+                            static_cast<unsigned long long>(alloc_info.allocationSize >> 20));
+                std::fflush(stdout);
+            }
+        }
+        device_memory =
+            Vulkan::Check(vk::ResultValue<vk::DeviceMemory>{alloc_result, device_memory});
+        arena_backed += alloc_info.allocationSize;
+
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset;
+        backing.offset = memory_base;
+        backing.owned = owned;
+        backing.last_use = use_epoch;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
         const auto& bind = binds->binds.emplace_back(vk::SparseMemoryBind{
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
-            .size = (range.end - range.start) << block_shift,
+            .size = alloc_info.allocationSize,
             .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .memoryOffset = memory_base,
         });
-        memory_offset += bind.size;
 
         for (u32 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
@@ -597,6 +610,83 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
+void BufferCache::ReleaseIdleBacking(bool memory_pressured) {
+    // bbport: the backing of the guest's memory only grew (a range stayed resident for the whole
+    // session once an area had loaded). Ranges no binding has used for two sweeps
+    // (BB_ARENA_IDLE_SECONDS, 60; 0 keeps the old behaviour) are unbound and their allocation
+    // freed; the guest faults them back in through the BDA page table when it returns to that
+    // area and uploads them again from guest memory, which still holds the data. Only while VRAM
+    // is under pressure: on a card with room the re-upload would cost more than it frees.
+    // A range the GPU wrote is left alone: it would have to be written back first, and that
+    // downloads with a submit, which the collector this runs from is already inside.
+    static const u64 idle_seconds = [] {
+        const char* env = std::getenv("BB_ARENA_IDLE_SECONDS");
+        return env ? std::strtoull(env, nullptr, 10) : 60;
+    }();
+    if (idle_seconds == 0 || resident_ranges.Empty()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - release_time < std::chrono::seconds(idle_seconds)) {
+        return;
+    }
+    release_time = now;
+    // Stamped by EnsureResident: one sweep less than this epoch means it was not used since the
+    // previous one. Advanced even when nothing is freed, so the ages stay in sweeps.
+    ++use_epoch;
+    if (!memory_pressured) {
+        return;
+    }
+
+    std::vector<Backing> keep;
+    boost::container::small_vector<Backing, 16> release;
+    keep.reserve(resident_ranges.Size());
+    for (const Backing& backing : resident_ranges) {
+        const auto* arena = address_space[backing.start >> blocks_per_arena_page_shift];
+        const VAddr address = backing.start << block_shift;
+        const u64 size = (backing.end - backing.start) << block_shift;
+        // Both records of a GPU write must be clear: the tracker's readback bits that
+        // DownloadMemory follows, and the pending write-back ranges.
+        if (arena && release.size() < 64 && backing.owned && use_epoch - backing.last_use >= 2 &&
+            !IsRegionGpuModified(address, size) && !gpu_modified_ranges.Intersects(address, size)) {
+            release.push_back(backing);
+        } else {
+            keep.push_back(backing);
+        }
+    }
+    if (release.empty()) {
+        return;
+    }
+    resident_ranges.Reset(std::move(keep));
+
+    u64 freed = 0;
+    for (const Backing& backing : release) {
+        const auto* arena = address_space[backing.start >> blocks_per_arena_page_shift];
+        const VAddr address = backing.start << block_shift;
+        const u64 size = (backing.end - backing.start) << block_shift;
+        BindsForArena(arena)->binds.emplace_back(vk::SparseMemoryBind{
+            .resourceOffset = address - arena->cpu_addr,
+            .size = size,
+            .memory = {},
+            .memoryOffset = 0,
+        });
+        // Zero the page table entries: the next access faults instead of reading freed memory.
+        runtime.FillBuffer(bda_pagetable_buffer.get(), backing.start * sizeof(vk::DeviceAddress),
+                           (backing.end - backing.start) * sizeof(vk::DeviceAddress), 0u);
+        memory_tracker->MarkRegionAsCpuModified(address, size);
+        // Freed once the submission carrying the unbind has completed.
+        scheduler.DeferOperation([device = instance.GetDevice(),
+                                  memory = backing.memory] { device.freeMemory(memory); });
+        arena_backed -= size;
+        arena_allocated -= size;
+        freed += size;
+    }
+    std::printf("GPU: released %llu MiB of game memory backing unused for %llu s (%zu ranges)\n",
+                static_cast<unsigned long long>(freed >> 20),
+                static_cast<unsigned long long>(idle_seconds), release.size());
+    std::fflush(stdout);
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,

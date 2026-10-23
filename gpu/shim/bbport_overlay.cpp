@@ -57,6 +57,10 @@ bool dirty = false; // settings changed while open: saved on close
 // The game's text dialog (SetTextEntry), guarded by imgui_mutex.
 bool text_entry_active = false;
 std::string text_entry_prompt, text_entry_text;
+// Video memory warning (BbOverlay::Warn): text from the GPU thread, read by the present thread.
+std::mutex warn_mutex;
+std::string warn_text;
+std::chrono::steady_clock::time_point warn_until{};
 float base_scale = 1.0f;
 
 // Present rate for the FPS counter.
@@ -590,6 +594,39 @@ void FpsCounter() {
     ImGui::End();
 }
 
+bool WarningActive() {
+    std::scoped_lock lock{warn_mutex};
+    return !warn_text.empty() && std::chrono::steady_clock::now() < warn_until;
+}
+
+// Amber banner at the top of the screen: the player should save before the game runs out of
+// video memory (nothing is blocked; the game still crashes if it has to).
+void WarningBanner() {
+    std::string text;
+    {
+        std::scoped_lock lock{warn_mutex};
+        text = warn_text;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + 24.0f * base_scale),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.92f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.42f, 0.20f, 0.02f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.95f, 0.60f, 0.20f, 1.0f));
+    if (ImGui::Begin("##vram-warning", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                         ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::PushTextWrapPos(520.0f * base_scale);
+        ImGui::TextUnformatted(text.c_str());
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+}
+
 } // namespace
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
@@ -758,7 +795,8 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || BbSettings::Get().show_fps);
+    return initialized &&
+           (menu_open || text_entry_active || BbSettings::Get().show_fps || WarningActive());
 }
 
 bool CapturesInput() {
@@ -770,6 +808,12 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_active = active;
     text_entry_prompt = prompt;
     text_entry_text = text;
+}
+
+void Warn(const std::string& text) {
+    std::scoped_lock lock{warn_mutex};
+    warn_text = text;
+    warn_until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 }
 
 // Called for every presented image: the interval for the FPS readout and BB_FPS_LOG.
@@ -830,6 +874,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (text_entry_active) {
         TextEntryBox();
+    }
+    if (WarningActive()) {
+        WarningBanner();
     }
     ImGui::Render();
 

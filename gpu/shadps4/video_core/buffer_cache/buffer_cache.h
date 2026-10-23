@@ -5,6 +5,7 @@
 
 #include "bbport_copy.h"
 
+#include <chrono>
 #include <deque>
 #include <boost/container/small_vector.hpp>
 
@@ -106,8 +107,8 @@ public:
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 
-    /// bbport: memory backing guest memory for the GPU (never freed), the reserve kept for it,
-    /// and the part of the reserve used (for the memory report).
+    /// bbport: memory backing guest memory for the GPU, the reserve kept for it, and the part of
+    /// the reserve used (for the memory report).
     [[nodiscard]] u64 ArenaBackedBytes() const { return arena_backed; }
     [[nodiscard]] u64 ArenaReserveBytes() const { return reserve_size; }
     [[nodiscard]] u64 ArenaReserveUsedBytes() const { return reserve_used; }
@@ -117,6 +118,11 @@ public:
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
+
+    /// bbport: frees the backing of the ranges no binding has used for BB_ARENA_IDLE_SECONDS
+    /// (default 60, 0 keeps them for the session). The guest faults them back in, so this only
+    /// runs while VRAM is pressured. Call it once per collector sweep.
+    void ReleaseIdleBacking(bool memory_pressured);
 
 private:
     struct ArenaBinds {
@@ -184,14 +190,22 @@ private:
     struct Backing : public Interval {
         vk::DeviceMemory memory;
         u64 offset;
+        /// bbport: allocated for this range alone (not a slice of the reserve), so it can be freed.
+        bool owned;
+        /// bbport: `use_epoch` when a binding last asked for the range (ReleaseIdleBacking).
+        u64 last_use;
         constexpr bool CanMergeWith(const Backing& other) const noexcept {
-            return memory == other.memory && offset + (end - start) == other.offset;
+            return memory == other.memory && offset + (end - start) == other.offset &&
+                   owned == other.owned && last_use == other.last_use;
         }
         constexpr Backing SubRange(u64 a, u64 b) const noexcept {
-            return {{a, b}, memory, offset + (a - start)};
+            return {{a, b}, memory, offset + (a - start), owned, last_use};
         }
     };
     IntervalList<Backing> resident_ranges;
+    u64 use_epoch{}; ///< bbport: sweeps of ReleaseIdleBacking, see Backing::last_use.
+    std::chrono::steady_clock::time_point release_time{};
+    u64 arena_allocated{}; ///< bbport: BB_ARENA_LIMIT_MB accounting (the test knob)
 
     u32 arena_memory_type_index{};
     u32 arena_memory_type_bits{}; ///< bbport: the types the arena accepts (system memory fallback)

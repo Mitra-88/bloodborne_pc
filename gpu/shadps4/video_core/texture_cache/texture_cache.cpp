@@ -6,6 +6,7 @@
 #include <boost/container/small_vector.hpp>
 #include <xxhash.h>
 
+#include "bbport_overlay.h"
 #include "bbport_process_memory.h"
 #include "bbport_prompts.h"
 #include "bbport_toggles.h"
@@ -1112,6 +1113,12 @@ void TextureCache::ReportMemory() {
 }
 
 void TextureCache::GarbageCollectImages() {
+    // bbport: BB_GC_BUDGET_MB=N forces a fixed budget on any GPU (tests on a desktop, the
+    // low-VRAM profile); the marks and the VRAM warning below follow it.
+    static const u64 forced_budget = [] {
+        const char* env = std::getenv("BB_GC_BUDGET_MB");
+        return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
+    }();
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
         // bbport: the buffer cache's reserve (512 MiB of VRAM allocated at start for the game's
@@ -1125,17 +1132,39 @@ void TextureCache::GarbageCollectImages() {
         // ~1 GB after its 8 GB system reserve: usage stayed above the critical mark, so the
         // collector evicted images used two or three frames ago on every submission and wrote
         // GPU-written ones back. Compare with the driver's current budget instead.
-        // BB_GC_BUDGET_MB=N: this rule with a fixed budget on any GPU (tests on a desktop).
-        static const u64 forced_budget = [] {
-            const char* env = std::getenv("BB_GC_BUDGET_MB");
-            return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
-        }();
         if (instance.IsIntegrated() || forced_budget) {
             const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
             if (budget != 0) {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
                 critical_gc_memory = budget / 100 * 95;
+            }
+        }
+        // bbport: tell the player before the card is full, 1.5 GB ahead by default
+        // (BB_VRAM_WARN_MB, 0 turns it off), again each 256 MiB closer. Nothing is blocked: the
+        // game still crashes when it runs out, but the player has time to save. Discrete cards
+        // only (an integrated GPU's limit is the system's memory, which is not the crash).
+        static const u64 warn_mb = [] {
+            const char* env = std::getenv("BB_VRAM_WARN_MB");
+            return env ? std::strtoull(env, nullptr, 10) : 1536;
+        }();
+        if (warn_mb != 0 && !instance.IsIntegrated()) {
+            const u64 limit = forced_budget ? forced_budget : instance.GetTotalMemoryBudget();
+            const u64 free = limit > total_used_memory ? limit - total_used_memory : 0;
+            constexpr u64 warn_step = 256_MB;
+            const u64 warn_at = warn_mb << 20;
+            static u64 warned_free = ~0ULL; // armed; free bytes at the last warning otherwise
+            if (free >= warn_at) {
+                warned_free = ~0ULL;
+            } else if (warned_free == ~0ULL || free + warn_step <= warned_free) {
+                warned_free = free;
+                BbOverlay::Warn(fmt::format(
+                    "Video memory is almost full: {:.1f} GB left of {:.1f} GB. "
+                    "Save your game now; the game may close when it runs out.",
+                    float(free) / float(1_GB), float(limit) / float(1_GB)));
+                std::printf("VRAM: %llu MiB free of %llu MiB, warned the player to save\n",
+                            static_cast<unsigned long long>(free >> 20),
+                            static_cast<unsigned long long>(limit >> 20));
             }
         }
     }
@@ -1153,6 +1182,9 @@ void TextureCache::GarbageCollectImages() {
         gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
     }
     ReportMemory();
+    // bbport: under VRAM pressure, free the game memory backing of the ranges no binding has used
+    // for a minute. Once a minute at most, see BufferCache::ReleaseIdleBacking.
+    buffer_cache.ReleaseIdleBacking(total_used_memory >= pressure_gc_memory);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1333,6 +1365,17 @@ void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
+
+    // bbport: the guest submits hundreds of times a second, and every sweep walks up to 256 LRU
+    // entries under a mutex the guest's fault handlers share. The earliest age it acts on is a
+    // second, so below the pressure mark 20 sweeps a second do the same job for a fraction of
+    // the frames; over the mark every submission still sweeps.
+    const auto now = std::chrono::steady_clock::now();
+    if (total_used_memory < pressure_gc_memory &&
+        now - gc_sweep_time < std::chrono::milliseconds(50)) {
+        return;
+    }
+    gc_sweep_time = now;
 
     GarbageCollectImages();
     GarbageCollectSamplers();
