@@ -20,7 +20,9 @@ MINGW*|MSYS*)
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
+    # compile_commands.json feeds VS Code IntelliSense with the exact flags and include dirs.
     cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
+        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
         -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
     echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-fg401-capabilities bb-play > out/gpu-build.log 2>&1; then
@@ -70,6 +72,7 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
     fi
 done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
